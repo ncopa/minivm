@@ -10,3 +10,11 @@ Small POSIX shell manager for QEMU VMs on macOS.
 ./minivm.sh ssh edge root
 ./minivm.sh list
 ```
+
+For `net=socket_vmnet`, `minivm.sh` can manage a shared `socket_vmnet` daemon:
+
+```sh
+sudo ./minivm.sh socket-vmnet-start
+sudo ./minivm.sh start edge
+./minivm.sh socket-vmnet-status
+```

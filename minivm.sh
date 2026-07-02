@@ -15,7 +15,15 @@ DISK_SIZE_DEFAULT=${DISK_SIZE_DEFAULT:-64G}
 DISK_FORMAT_DEFAULT=${DISK_FORMAT_DEFAULT:-qcow2}
 SSH_PORT_BASE=${SSH_PORT_BASE:-22000}
 SOCKET_VMNET_CLIENT_BIN=${SOCKET_VMNET_CLIENT_BIN:-}
+SOCKET_VMNET_BIN=${SOCKET_VMNET_BIN:-}
 SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30}
+SOCKET_VMNET_RUNTIME_DIR=${SOCKET_VMNET_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/minivm/socket_vmnet}
+SOCKET_VMNET_PATH_DEFAULT=${SOCKET_VMNET_PATH_DEFAULT:-$SOCKET_VMNET_RUNTIME_DIR/socket_vmnet.sock}
+SOCKET_VMNET_PIDFILE_DEFAULT=${SOCKET_VMNET_PIDFILE_DEFAULT:-$SOCKET_VMNET_RUNTIME_DIR/socket_vmnet.pid}
+SOCKET_VMNET_LOG_DEFAULT=${SOCKET_VMNET_LOG_DEFAULT:-$SOCKET_VMNET_RUNTIME_DIR/socket_vmnet.log}
+SOCKET_VMNET_MODE_DEFAULT=${SOCKET_VMNET_MODE_DEFAULT:-shared}
+SOCKET_VMNET_IFACE_DEFAULT=${SOCKET_VMNET_IFACE_DEFAULT:-}
+SOCKET_VMNET_IFACE_MAC_DEFAULT=${SOCKET_VMNET_IFACE_MAC_DEFAULT:-}
 
 usage() {
 	cat <<EOF
@@ -23,6 +31,9 @@ Usage:
   $PROG create NAME [key=value ...]
   $PROG run NAME [-- qemu-args...]
   $PROG start NAME [-- qemu-args...]
+  $PROG socket-vmnet-start
+  $PROG socket-vmnet-stop
+  $PROG socket-vmnet-status
   $PROG kill NAME
   $PROG poweroff NAME
   $PROG reboot NAME
@@ -33,14 +44,14 @@ Usage:
 
 Config keys:
   disk, disk_size, disk_format, cdrom, memory, cpus, ssh_port, ssh_key, macaddr
-  net_iface, net_iface_mac, socket_vmnet_path, socket_vmnet_mode
+  net_iface, net_iface_mac, socket_vmnet_path
   qemu, qemu_img, efi, accel, machine, net, headless, boot, extra_args
 
 Notes:
   - macOS/Apple Silicon defaults are tuned for aarch64 guests with hvf.
   - 'run' stays in the foreground. 'start' daemonizes and writes a pid file.
   - Prefer net_iface_mac for removable USB NICs with net=vmnet-bridged.
-  - socket_vmnet requires an already-running socket_vmnet daemon.
+  - socket_vmnet uses one shared daemon; start it explicitly with sudo.
 EOF
 }
 
@@ -137,6 +148,33 @@ default_socket_vmnet_client() {
 		fi
 	done
 	printf '%s\n' socket_vmnet_client
+}
+
+default_socket_vmnet() {
+	if [ -n "$SOCKET_VMNET_BIN" ]; then
+		printf '%s\n' "$SOCKET_VMNET_BIN"
+		return
+	fi
+	for bin in \
+		/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet \
+		/usr/local/opt/socket_vmnet/bin/socket_vmnet
+	do
+		if [ -x "$bin" ]; then
+			printf '%s\n' "$bin"
+			return
+		fi
+	done
+	printf '%s\n' socket_vmnet
+}
+
+resolve_socket_vmnet() {
+	daemon=$(default_socket_vmnet)
+	if [ "${daemon#/}" != "$daemon" ]; then
+		[ -x "$daemon" ] || die "socket_vmnet not found at '$daemon'"
+	else
+		have "$daemon" || die "socket_vmnet not found; install socket_vmnet or set SOCKET_VMNET_BIN"
+	fi
+	printf '%s\n' "$daemon"
 }
 
 resolve_socket_vmnet_client() {
@@ -338,14 +376,134 @@ load_config() {
 	net_iface=${net_iface:-}
 	net_iface_mac=${net_iface_mac:-}
 	socket_vmnet_path=${socket_vmnet_path:-}
-	socket_vmnet_mode=${socket_vmnet_mode:-shared}
 	headless=${headless:-yes}
 	boot=${boot:-menu=on,splash-time=0}
 	extra_args=${extra_args:-}
+	if [ -z "$socket_vmnet_path" ]; then
+		socket_vmnet_path=$SOCKET_VMNET_PATH_DEFAULT
+	fi
 }
 
 cleanup_runtime() {
 	rm -f "$pidfile" "$qmp_socket" "$qga_socket"
+}
+
+socket_vmnet_mode() {
+	printf '%s\n' "$SOCKET_VMNET_MODE_DEFAULT"
+}
+
+socket_vmnet_path() {
+	printf '%s\n' "$SOCKET_VMNET_PATH_DEFAULT"
+}
+
+socket_vmnet_pidfile() {
+	printf '%s\n' "$SOCKET_VMNET_PIDFILE_DEFAULT"
+}
+
+socket_vmnet_log() {
+	printf '%s\n' "$SOCKET_VMNET_LOG_DEFAULT"
+}
+
+cleanup_socket_vmnet_runtime() {
+	rm -f "$(socket_vmnet_pidfile)" "$(socket_vmnet_path)"
+}
+
+socket_vmnet_running() {
+	[ -f "$(socket_vmnet_pidfile)" ] || return 1
+	socket_vmnet_pid=$(cat "$(socket_vmnet_pidfile)")
+	kill -0 "$socket_vmnet_pid" 2>/dev/null || {
+		cleanup_socket_vmnet_runtime
+		return 1
+	}
+	return 0
+}
+
+require_root() {
+	[ "$(id -u)" -eq 0 ] || die "$1"
+}
+
+socket_vmnet_bridge_iface() {
+	if [ -n "$SOCKET_VMNET_IFACE_MAC_DEFAULT" ]; then
+		resolve_iface_by_mac "$SOCKET_VMNET_IFACE_MAC_DEFAULT"
+		return
+	fi
+	if [ -n "$SOCKET_VMNET_IFACE_DEFAULT" ]; then
+		printf '%s\n' "$SOCKET_VMNET_IFACE_DEFAULT"
+		return
+	fi
+	die "shared socket_vmnet bridged mode requires SOCKET_VMNET_IFACE_MAC_DEFAULT or SOCKET_VMNET_IFACE_DEFAULT"
+}
+
+start_socket_vmnet() {
+	require_root "starting socket_vmnet requires sudo"
+
+	mkdir -p "$SOCKET_VMNET_RUNTIME_DIR"
+	if socket_vmnet_running; then
+		printf '%s\n' "socket_vmnet already running"
+		return 0
+	fi
+	rm -f "$(socket_vmnet_path)"
+
+	socket_vmnet_bin=$(resolve_socket_vmnet)
+	mode=$(socket_vmnet_mode)
+	set -- "$socket_vmnet_bin" "--vmnet-mode=$mode" "-p" "$(socket_vmnet_pidfile)"
+	case $mode in
+	shared|host)
+		:
+		;;
+	bridged)
+		set -- "$@" "--vmnet-interface=$(socket_vmnet_bridge_iface)"
+		;;
+	*)
+		die "unsupported socket_vmnet mode '$mode'"
+		;;
+	esac
+	set -- "$@" "$(socket_vmnet_path)"
+	"$@" >>"$(socket_vmnet_log)" 2>&1 &
+
+	wait=50
+	while [ "$wait" -gt 0 ]; do
+		if [ -S "$(socket_vmnet_path)" ]; then
+			printf '%s\n' "started socket_vmnet"
+			return 0
+		fi
+		if [ -f "$(socket_vmnet_pidfile)" ]; then
+			socket_vmnet_pid=$(cat "$(socket_vmnet_pidfile)")
+			if ! kill -0 "$socket_vmnet_pid" 2>/dev/null; then
+				break
+			fi
+		fi
+		sleep 0.1
+		wait=$((wait - 1))
+	done
+
+	cleanup_socket_vmnet_runtime
+	die "failed to start socket_vmnet; check $(socket_vmnet_log)"
+}
+
+stop_socket_vmnet() {
+	require_root "stopping socket_vmnet requires sudo"
+	socket_vmnet_running || die "socket_vmnet is not running"
+	kill "$socket_vmnet_pid"
+	wait=50
+	while [ "$wait" -gt 0 ]; do
+		if ! kill -0 "$socket_vmnet_pid" 2>/dev/null; then
+			cleanup_socket_vmnet_runtime
+			printf '%s\n' "stopped socket_vmnet"
+			return 0
+		fi
+		sleep 0.1
+		wait=$((wait - 1))
+	done
+	die "timed out waiting for socket_vmnet to stop"
+}
+
+socket_vmnet_status() {
+	if socket_vmnet_running; then
+		printf '%s\n' "socket_vmnet running (pid $socket_vmnet_pid, socket $(socket_vmnet_path))"
+	else
+		printf '%s\n' "socket_vmnet stopped"
+	fi
 }
 
 require_running_vm() {
@@ -473,15 +631,7 @@ assemble_qemu() {
 		;;
 	socket_vmnet)
 		[ -n "$socket_vmnet_path" ] || die "net=socket_vmnet requires socket_vmnet_path"
-		[ -S "$socket_vmnet_path" ] || die "socket_vmnet_path '$socket_vmnet_path' is not a socket; start socket_vmnet first"
-		case $socket_vmnet_mode in
-		shared|host|bridged)
-			:
-			;;
-		*)
-			die "unsupported socket_vmnet_mode '$socket_vmnet_mode'"
-			;;
-		esac
+		[ -S "$socket_vmnet_path" ] || die "socket_vmnet_path '$socket_vmnet_path' is not a socket; start the shared socket_vmnet first"
 		set -- "$@" \
 			-netdev "socket,id=net0,fd=3" \
 			-device "virtio-net-pci,netdev=net0,mac=$macaddr"
@@ -608,8 +758,7 @@ create_vm() {
 		disk="$disk" \
 		net_iface="" \
 		net_iface_mac="" \
-		socket_vmnet_path="" \
-		socket_vmnet_mode="shared" \
+		socket_vmnet_path="$SOCKET_VMNET_PATH_DEFAULT" \
 		net="user" \
 		headless="yes" \
 		boot="menu=on,splash-time=0" \
@@ -646,7 +795,6 @@ create_vm() {
 		net_iface="$net_iface" \
 		net_iface_mac="$net_iface_mac" \
 		socket_vmnet_path="$socket_vmnet_path" \
-		socket_vmnet_mode="$socket_vmnet_mode" \
 		net="$net" \
 		headless="$headless" \
 		boot="$boot" \
@@ -753,6 +901,18 @@ start)
 	name=$1
 	shift
 	start_vm "$name" "$@"
+	;;
+socket-vmnet-start)
+	[ $# -eq 0 ] || die "socket-vmnet-start takes no arguments"
+	start_socket_vmnet
+	;;
+socket-vmnet-stop)
+	[ $# -eq 0 ] || die "socket-vmnet-stop takes no arguments"
+	stop_socket_vmnet
+	;;
+socket-vmnet-status)
+	[ $# -eq 0 ] || die "socket-vmnet-status takes no arguments"
+	socket_vmnet_status
 	;;
 kill)
 	[ $# -eq 1 ] || die "kill requires NAME"
