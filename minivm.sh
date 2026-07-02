@@ -46,7 +46,7 @@ Usage:
   $PROG delete NAME
 
 Config keys:
-  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_identity, macaddr
+  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_identity, ssh_authorized_keys, macaddr
   net_iface, net_iface_mac, socket_vmnet_path
   qemu, qemu_img, efi, accel, machine, net, headless, boot, extra_args
 
@@ -222,6 +222,67 @@ qemu_img_format() {
 	format=$("$qemu_img" info "$image" 2>/dev/null | awk '/^file format: / { print $3; exit }')
 	[ -n "$format" ] || die "failed to detect disk format for '$image'"
 	printf '%s\n' "$format"
+}
+
+resolve_iso_creator() {
+	for bin in mkisofs genisoimage; do
+		if have "$bin"; then
+			printf '%s\n' "$bin"
+			return
+		fi
+	done
+	if have hdiutil; then
+		printf '%s\n' hdiutil
+		return
+	fi
+	die "mkisofs, genisoimage, or hdiutil is required to build CIDATA"
+}
+
+quote_yaml() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+append_authorized_keys_yaml() {
+	value=$1
+	if [ -f "$value" ]; then
+		key_lines=$(cat "$value")
+	else
+		key_lines=$value
+	fi
+	printf '%s\n' "$key_lines" | while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		printf '  - %s\n' "$(quote_yaml "$line")"
+	done
+}
+
+build_cidata() {
+	name=$1
+	cloud_init_dir=$instance_dir/cloud-init
+	meta_data=$cloud_init_dir/meta-data
+	user_data=$cloud_init_dir/user-data
+	cidata_iso=$instance_dir/cidata.iso
+	iso_creator=$(resolve_iso_creator)
+
+	mkdir -p "$cloud_init_dir"
+	cat >"$meta_data" <<EOF
+instance-id: $name
+local-hostname: $name
+EOF
+	{
+		printf '%s\n' '#cloud-config'
+		printf '%s\n' 'ssh_authorized_keys:'
+		append_authorized_keys_yaml "$ssh_authorized_keys"
+	} >"$user_data"
+
+	rm -f "$cidata_iso"
+	case $iso_creator in
+	mkisofs|genisoimage)
+		"$iso_creator" -output "$cidata_iso" -volid cidata -joliet -rock "$user_data" "$meta_data" >/dev/null 2>&1
+		;;
+	hdiutil)
+		"$iso_creator" makehybrid -quiet -o "$cidata_iso" -iso -joliet -default-volume-name cidata "$cloud_init_dir"
+		;;
+	esac
 }
 
 resolve_ip_by_mac() {
@@ -409,6 +470,7 @@ load_config() {
 	image_url=${image_url:-}
 	ssh_port=${ssh_port:-$(default_ssh_port "$name")}
 	ssh_identity=${ssh_identity:-}
+	ssh_authorized_keys=${ssh_authorized_keys:-}
 	macaddr=${macaddr:-$(default_mac "$name")}
 	net=${net:-user}
 	net_iface=${net_iface:-}
@@ -685,8 +747,16 @@ assemble_qemu() {
 		set -- "$@" -drive "if=virtio,format=$disk_format,file=$disk"
 	fi
 
+	if [ -n "${cdrom:-}" ] || [ -f "$instance_dir/cidata.iso" ]; then
+		set -- "$@" -device qemu-xhci
+	fi
+
 	if [ -n "${cdrom:-}" ]; then
 		set -- "$@" -drive "if=none,media=cdrom,id=cdrom0,file=$cdrom" -device usb-storage,drive=cdrom0
+	fi
+
+	if [ -f "$instance_dir/cidata.iso" ]; then
+		set -- "$@" -drive "if=none,media=cdrom,id=cidata,file=$instance_dir/cidata.iso" -device usb-storage,drive=cidata
 	fi
 
 	case $net in
@@ -739,7 +809,6 @@ assemble_qemu() {
 	else
 		set -- "$@" \
 			-device virtio-gpu-pci \
-			-device qemu-xhci \
 			-device usb-kbd \
 			-device usb-tablet
 	fi
@@ -838,6 +907,7 @@ create_vm() {
 		macaddr="$macaddr" \
 		ssh_port="$ssh_port" \
 		ssh_identity="" \
+		ssh_authorized_keys="" \
 		disk_format="$disk_format" \
 		disk_size="$disk_size" \
 		disk="$disk" \
@@ -874,6 +944,7 @@ create_vm() {
 		macaddr="$macaddr" \
 		ssh_port="$ssh_port" \
 		ssh_identity="$ssh_identity" \
+		ssh_authorized_keys="$ssh_authorized_keys" \
 		disk_format="$disk_format" \
 		disk_size="${disk_size:-0}" \
 		disk="$disk" \
@@ -903,6 +974,9 @@ create_vm() {
 		fi
 	elif [ ! -e "$disk" ] && [ "${disk_size:-0}" != "0" ]; then
 		"$qemu_img" create -f "$disk_format" "$disk" "$disk_size" >/dev/null
+	fi
+	if [ -n "$ssh_authorized_keys" ]; then
+		build_cidata "$name"
 	fi
 	printf '%s\n' "created $name"
 }
