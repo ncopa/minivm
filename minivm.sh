@@ -266,7 +266,7 @@ build_cidata() {
 	mkdir -p "$cloud_init_dir"
 	cat >"$meta_data" <<EOF
 instance-id: $name
-local-hostname: $name
+hostname: $name
 EOF
 	{
 		printf '%s\n' '#cloud-config'
