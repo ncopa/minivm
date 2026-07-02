@@ -146,6 +146,120 @@ resolve_socket_vmnet_client() {
 	printf '%s\n' "$client"
 }
 
+resolve_ip_by_mac() {
+	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+	have arp || die "arp is required to resolve guest IP for MAC '$1'"
+	result=$(
+		arp -an 2>/dev/null | awk -v want="$want_mac" '
+			{
+				ip = $2
+				mac = tolower($4)
+				gsub(/[()]/, "", ip)
+				if (mac == want && ip ~ /^[0-9.]+$/) {
+					count++
+					found_ip = ip
+				}
+			}
+			END {
+				if (count == 1) {
+					print found_ip
+				} else if (count > 1) {
+					exit 2
+				} else {
+					exit 1
+				}
+			}
+		'
+	) || rc=$?
+	rc=${rc:-0}
+	case $rc in
+	0)
+		printf '%s\n' "$result"
+		;;
+	1)
+		die "could not resolve guest IP for MAC '$1'; check that the guest is up and visible in the ARP cache"
+		;;
+	2)
+		die "guest MAC '$1' matched multiple IP addresses in the ARP cache"
+		;;
+	*)
+		die "failed to resolve guest IP for MAC '$1'"
+		;;
+	esac
+}
+
+resolve_dhcp_lease_ip_by_mac() {
+	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+	lease_file=/var/db/dhcpd_leases
+	[ -r "$lease_file" ] || return 1
+	result=$(
+		awk -v want="$want_mac" '
+			BEGIN {
+				in_block = 0
+				block_ip = ""
+				block_mac = ""
+			}
+			/^\{/ {
+				in_block = 1
+				block_ip = ""
+				block_mac = ""
+				next
+			}
+			/^\}/ {
+				if (in_block && tolower(block_mac) == want && block_ip ~ /^[0-9.]+$/) {
+					count++
+					found_ip = block_ip
+				}
+				in_block = 0
+				next
+			}
+			in_block && /^[[:space:]]*ip_address=/ {
+				block_ip = $0
+				sub(/^[[:space:]]*ip_address=/, "", block_ip)
+				next
+			}
+			in_block && /^[[:space:]]*hw_address=/ {
+				block_mac = $0
+				sub(/^[[:space:]]*hw_address=[^,]*,/, "", block_mac)
+				next
+			}
+			END {
+				if (count == 1) {
+					print found_ip
+				} else if (count > 1) {
+					exit 2
+				} else {
+					exit 1
+				}
+			}
+		' "$lease_file"
+	) || rc=$?
+	rc=${rc:-0}
+	case $rc in
+	0)
+		printf '%s\n' "$result"
+		return 0
+		;;
+	1)
+		return 1
+		;;
+	2)
+		die "guest MAC '$1' matched multiple IP addresses in the DHCP lease database"
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+resolve_guest_ip() {
+	if ip=$(resolve_dhcp_lease_ip_by_mac "$1" 2>/dev/null); then
+		printf '%s\n' "$ip"
+		return
+	fi
+	resolve_ip_by_mac "$1"
+}
+
 resolve_iface_by_mac() {
 	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 	have networksetup || die "networksetup is required to resolve net_iface_mac"
@@ -484,8 +598,20 @@ ssh_vm() {
 	name=$1
 	shift
 	load_config "$name"
-	[ "$net" = "user" ] || die "ssh is only supported with net=user; use the guest IP for net=$net"
-	ssh_args="-p $(quote_sh "$ssh_port") -o IdentitiesOnly=yes"
+	case $net in
+	user)
+		ssh_host=127.0.0.1
+		ssh_port_value=$ssh_port
+		;;
+	socket_vmnet)
+		ssh_host=$(resolve_guest_ip "$macaddr")
+		ssh_port_value=22
+		;;
+	*)
+		die "ssh is only supported with net=user or net=socket_vmnet; use the guest IP for net=$net"
+		;;
+	esac
+	ssh_args="-p $(quote_sh "$ssh_port_value") -o IdentitiesOnly=yes"
 	remote_args=
 	if [ -n "$ssh_key" ]; then
 		ssh_args="$ssh_args -i $(quote_sh "$ssh_key")"
@@ -501,7 +627,7 @@ ssh_vm() {
 	for arg do
 		remote_args="$remote_args $(quote_sh "$arg")"
 	done
-	eval "exec ssh $ssh_args 127.0.0.1$remote_args"
+	eval "exec ssh $ssh_args $(quote_sh "$ssh_host")$remote_args"
 }
 
 delete_vm() {
