@@ -15,6 +15,7 @@ DISK_SIZE_DEFAULT=${DISK_SIZE_DEFAULT:-64G}
 DISK_FORMAT_DEFAULT=${DISK_FORMAT_DEFAULT:-qcow2}
 SSH_PORT_BASE=${SSH_PORT_BASE:-22000}
 SOCKET_VMNET_CLIENT_BIN=${SOCKET_VMNET_CLIENT_BIN:-}
+SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-30}
 
 usage() {
 	cat <<EOF
@@ -22,7 +23,9 @@ Usage:
   $PROG create NAME [key=value ...]
   $PROG run NAME [-- qemu-args...]
   $PROG start NAME [-- qemu-args...]
-  $PROG stop NAME
+  $PROG kill NAME
+  $PROG poweroff NAME
+  $PROG reboot NAME
   $PROG ssh NAME [ssh-opts...] [-- remote-cmd...]
   $PROG list
   $PROG show NAME
@@ -341,6 +344,71 @@ load_config() {
 	extra_args=${extra_args:-}
 }
 
+cleanup_runtime() {
+	rm -f "$pidfile" "$qmp_socket" "$qga_socket"
+}
+
+require_running_vm() {
+	name=$1
+	load_config "$name"
+	[ -f "$pidfile" ] || die "instance '$name' is not running"
+	pid=$(cat "$pidfile")
+	kill -0 "$pid" 2>/dev/null || {
+		cleanup_runtime
+		die "instance '$name' is not running"
+	}
+}
+
+wait_for_vm_exit() {
+	timeout=$1
+	while [ "$timeout" -gt 0 ]; do
+		if ! kill -0 "$pid" 2>/dev/null; then
+			cleanup_runtime
+			return 0
+		fi
+		sleep 1
+		timeout=$((timeout - 1))
+	done
+	return 1
+}
+
+qmp_send() {
+	socket=$1
+	command=$2
+	have socat || die "socat is required for QMP control"
+	{
+		printf '%s\r\n' '{"execute":"qmp_capabilities"}'
+		printf '%s\r\n' "$command"
+	} | socat -t 2 - "UNIX-CONNECT:$socket"
+}
+
+qga_send() {
+	socket=$1
+	command=$2
+	have socat || die "socat is required for QGA control"
+	{
+		printf '%s\r\n' '{"execute":"guest-sync","arguments":{"id":1}}'
+		printf '%s\r\n' "$command"
+	} | socat -t 2 - "UNIX-CONNECT:$socket"
+}
+
+qga_guest_shutdown() {
+	mode=$1
+	[ -S "$qga_socket" ] || return 1
+	response=$(qga_send "$qga_socket" "{\"execute\":\"guest-shutdown\",\"arguments\":{\"mode\":\"$mode\"}}" 2>/dev/null || true)
+	printf '%s\n' "$response" | grep -q '"error"' && return 1
+	printf '%s\n' "$response" | grep -q '"return"' || return 1
+	return 0
+}
+
+qmp_system_powerdown() {
+	[ -S "$qmp_socket" ] || return 1
+	response=$(qmp_send "$qmp_socket" '{"execute":"system_powerdown"}' 2>/dev/null || true)
+	printf '%s\n' "$response" | grep -q '"error"' && return 1
+	printf '%s\n' "$response" | grep -q '"return"' || return 1
+	return 0
+}
+
 assemble_qemu() {
 	load_config "$1"
 	shift
@@ -480,14 +548,33 @@ start_vm() {
 	printf '%s\n' "started $name"
 }
 
-stop_vm() {
+kill_vm() {
 	name=$1
-	load_config "$name"
-	[ -f "$pidfile" ] || die "instance '$name' is not running"
-	pid=$(cat "$pidfile")
+	require_running_vm "$name"
 	kill "$pid"
-	rm -f "$pidfile" "$qmp_socket" "$qga_socket"
-	printf '%s\n' "stopped $name"
+	cleanup_runtime
+	printf '%s\n' "killed $name"
+}
+
+poweroff_vm() {
+	name=$1
+	require_running_vm "$name"
+	if qga_guest_shutdown powerdown; then
+		:
+	elif qmp_system_powerdown; then
+		:
+	else
+		die "failed to request poweroff for '$name'"
+	fi
+	wait_for_vm_exit "$SHUTDOWN_TIMEOUT" || die "timed out waiting for '$name' to power off"
+	printf '%s\n' "powered off $name"
+}
+
+reboot_vm() {
+	name=$1
+	require_running_vm "$name"
+	qga_guest_shutdown reboot || die "failed to request reboot for '$name'; QEMU guest agent is unavailable"
+	printf '%s\n' "reboot requested for $name"
 }
 
 create_vm() {
@@ -634,7 +721,7 @@ delete_vm() {
 	name=$1
 	load_config "$name"
 	if [ -f "$pidfile" ]; then
-		die "instance '$name' is running; stop it first"
+		die "instance '$name' is running; kill it first"
 	fi
 	rm -rf "$instance_dir"
 	printf '%s\n' "deleted $name"
@@ -667,9 +754,17 @@ start)
 	shift
 	start_vm "$name" "$@"
 	;;
-stop)
-	[ $# -eq 1 ] || die "stop requires NAME"
-	stop_vm "$1"
+kill)
+	[ $# -eq 1 ] || die "kill requires NAME"
+	kill_vm "$1"
+	;;
+poweroff)
+	[ $# -eq 1 ] || die "poweroff requires NAME"
+	poweroff_vm "$1"
+	;;
+reboot)
+	[ $# -eq 1 ] || die "reboot requires NAME"
+	reboot_vm "$1"
 	;;
 ssh)
 	[ $# -ge 1 ] || die "ssh requires NAME"
