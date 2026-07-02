@@ -13,6 +13,18 @@ Small POSIX shell manager for QEMU VMs on macOS.
 ./minivm.sh list
 ```
 
+To attach a VM to the shared `socket_vmnet` network:
+
+```sh
+sudo ./minivm.sh socket-vmnet-start --gateway=192.168.105.1
+./minivm.sh create tiny \
+  image_url=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-aarch64-uefi-tiny-r0.qcow2 \
+  net=socket_vmnet \
+  ssh_authorized_keys=$HOME/.ssh/id_ed25519.pub
+./minivm.sh start tiny
+./minivm.sh ssh root@tiny
+```
+
 For `net=socket_vmnet`, `minivm.sh` can manage a shared `socket_vmnet` daemon:
 
 ```sh
