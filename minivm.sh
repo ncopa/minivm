@@ -24,6 +24,9 @@ SOCKET_VMNET_LOG_DEFAULT=${SOCKET_VMNET_LOG_DEFAULT:-$SOCKET_VMNET_RUNTIME_DIR/s
 SOCKET_VMNET_MODE_DEFAULT=${SOCKET_VMNET_MODE_DEFAULT:-shared}
 SOCKET_VMNET_IFACE_DEFAULT=${SOCKET_VMNET_IFACE_DEFAULT:-}
 SOCKET_VMNET_IFACE_MAC_DEFAULT=${SOCKET_VMNET_IFACE_MAC_DEFAULT:-}
+SOCKET_VMNET_GATEWAY_DEFAULT=${SOCKET_VMNET_GATEWAY_DEFAULT:-}
+SOCKET_VMNET_DHCP_END_DEFAULT=${SOCKET_VMNET_DHCP_END_DEFAULT:-}
+SOCKET_VMNET_MASK_DEFAULT=${SOCKET_VMNET_MASK_DEFAULT:-}
 
 usage() {
 	cat <<EOF
@@ -31,7 +34,7 @@ Usage:
   $PROG create NAME [key=value ...]
   $PROG run NAME [-- qemu-args...]
   $PROG start NAME [-- qemu-args...]
-  $PROG socket-vmnet-start
+  $PROG socket-vmnet-start [--gateway=IP]
   $PROG socket-vmnet-stop
   $PROG socket-vmnet-status
   $PROG kill NAME
@@ -52,6 +55,7 @@ Notes:
   - 'run' stays in the foreground. 'start' daemonizes and writes a pid file.
   - Prefer net_iface_mac for removable USB NICs with net=vmnet-bridged.
   - socket_vmnet uses one shared daemon; start it explicitly with sudo.
+  - Shared socket_vmnet settings can be tuned with SOCKET_VMNET_*_DEFAULT env vars.
 EOF
 }
 
@@ -422,6 +426,14 @@ require_root() {
 	[ "$(id -u)" -eq 0 ] || die "$1"
 }
 
+socket_vmnet_gateway() {
+	if [ -n "${socket_vmnet_gateway_override:-}" ]; then
+		printf '%s\n' "$socket_vmnet_gateway_override"
+		return
+	fi
+	printf '%s\n' "$SOCKET_VMNET_GATEWAY_DEFAULT"
+}
+
 socket_vmnet_bridge_iface() {
 	if [ -n "$SOCKET_VMNET_IFACE_MAC_DEFAULT" ]; then
 		resolve_iface_by_mac "$SOCKET_VMNET_IFACE_MAC_DEFAULT"
@@ -432,6 +444,38 @@ socket_vmnet_bridge_iface() {
 		return
 	fi
 	die "shared socket_vmnet bridged mode requires SOCKET_VMNET_IFACE_MAC_DEFAULT or SOCKET_VMNET_IFACE_DEFAULT"
+}
+
+append_socket_vmnet_network_args() {
+	mode=$1
+	shift
+	set -- "$@"
+	gateway=$(socket_vmnet_gateway)
+
+	if [ -n "$gateway" ]; then
+		set -- "$@" "--vmnet-gateway=$gateway"
+	fi
+	if [ -n "$SOCKET_VMNET_DHCP_END_DEFAULT" ]; then
+		set -- "$@" "--vmnet-dhcp-end=$SOCKET_VMNET_DHCP_END_DEFAULT"
+	fi
+	if [ -n "$SOCKET_VMNET_MASK_DEFAULT" ]; then
+		set -- "$@" "--vmnet-mask=$SOCKET_VMNET_MASK_DEFAULT"
+	fi
+
+	if [ "$mode" = "bridged" ]; then
+		if [ -n "$gateway" ] || [ -n "$SOCKET_VMNET_DHCP_END_DEFAULT" ] || [ -n "$SOCKET_VMNET_MASK_DEFAULT" ]; then
+			die "SOCKET_VMNET_GATEWAY_DEFAULT, SOCKET_VMNET_DHCP_END_DEFAULT, and SOCKET_VMNET_MASK_DEFAULT are only supported for shared or host mode"
+		fi
+	fi
+
+	if [ -n "$SOCKET_VMNET_DHCP_END_DEFAULT" ] && [ -z "$gateway" ]; then
+		die "SOCKET_VMNET_DHCP_END_DEFAULT requires SOCKET_VMNET_GATEWAY_DEFAULT"
+	fi
+	if [ -n "$SOCKET_VMNET_MASK_DEFAULT" ] && [ -z "$gateway" ]; then
+		die "SOCKET_VMNET_MASK_DEFAULT requires SOCKET_VMNET_GATEWAY_DEFAULT"
+	fi
+
+	printf '%s\n' "$*"
 }
 
 start_socket_vmnet() {
@@ -449,10 +493,17 @@ start_socket_vmnet() {
 	set -- "$socket_vmnet_bin" "--vmnet-mode=$mode" "-p" "$(socket_vmnet_pidfile)"
 	case $mode in
 	shared|host)
+		network_args=$(append_socket_vmnet_network_args "$mode")
+		if [ -n "$network_args" ]; then
+			# Intentional word splitting for validated socket_vmnet network flags.
+			# shellcheck disable=SC2086
+			set -- "$@" $network_args
+		fi
 		:
 		;;
 	bridged)
 		set -- "$@" "--vmnet-interface=$(socket_vmnet_bridge_iface)"
+		append_socket_vmnet_network_args "$mode" >/dev/null
 		;;
 	*)
 		die "unsupported socket_vmnet mode '$mode'"
@@ -903,7 +954,19 @@ start)
 	start_vm "$name" "$@"
 	;;
 socket-vmnet-start)
-	[ $# -eq 0 ] || die "socket-vmnet-start takes no arguments"
+	socket_vmnet_gateway_override=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--gateway=*)
+			socket_vmnet_gateway_override=${1#--gateway=}
+			[ -n "$socket_vmnet_gateway_override" ] || die "socket-vmnet-start requires a non-empty --gateway value"
+			;;
+		*)
+			die "socket-vmnet-start only supports [--gateway=IP]"
+			;;
+		esac
+		shift
+	done
 	start_socket_vmnet
 	;;
 socket-vmnet-stop)
