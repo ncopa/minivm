@@ -46,7 +46,7 @@ Usage:
   $PROG delete NAME
 
 Config keys:
-  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_key, macaddr
+  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_identity, macaddr
   net_iface, net_iface_mac, socket_vmnet_path
   qemu, qemu_img, efi, accel, machine, net, headless, boot, extra_args
 
@@ -408,7 +408,7 @@ load_config() {
 	disk=${disk:-$instance_dir/disk.$disk_format}
 	image_url=${image_url:-}
 	ssh_port=${ssh_port:-$(default_ssh_port "$name")}
-	ssh_key=${ssh_key:-}
+	ssh_identity=${ssh_identity:-}
 	macaddr=${macaddr:-$(default_mac "$name")}
 	net=${net:-user}
 	net_iface=${net_iface:-}
@@ -837,7 +837,7 @@ create_vm() {
 		cpus="$cpus" \
 		macaddr="$macaddr" \
 		ssh_port="$ssh_port" \
-		ssh_key="" \
+		ssh_identity="" \
 		disk_format="$disk_format" \
 		disk_size="$disk_size" \
 		disk="$disk" \
@@ -873,7 +873,7 @@ create_vm() {
 		cpus="$cpus" \
 		macaddr="$macaddr" \
 		ssh_port="$ssh_port" \
-		ssh_key="$ssh_key" \
+		ssh_identity="$ssh_identity" \
 		disk_format="$disk_format" \
 		disk_size="${disk_size:-0}" \
 		disk="$disk" \
@@ -949,8 +949,8 @@ ssh_vm() {
 	esac
 	ssh_args="-p $(quote_sh "$ssh_port_value") -o IdentitiesOnly=yes"
 	remote_args=
-	if [ -n "$ssh_key" ]; then
-		ssh_args="$ssh_args -i $(quote_sh "$ssh_key")"
+	if [ -n "$ssh_identity" ]; then
+		ssh_args="$ssh_args -i $(quote_sh "$ssh_identity")"
 	fi
 	while [ "$#" -gt 0 ]; do
 		if [ "$1" = "--" ]; then
