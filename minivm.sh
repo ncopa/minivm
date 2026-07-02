@@ -14,6 +14,7 @@ MEMORY_DEFAULT=${MEMORY_DEFAULT:-8G}
 DISK_SIZE_DEFAULT=${DISK_SIZE_DEFAULT:-64G}
 DISK_FORMAT_DEFAULT=${DISK_FORMAT_DEFAULT:-qcow2}
 SSH_PORT_BASE=${SSH_PORT_BASE:-22000}
+SOCKET_VMNET_CLIENT_BIN=${SOCKET_VMNET_CLIENT_BIN:-}
 
 usage() {
 	cat <<EOF
@@ -22,18 +23,21 @@ Usage:
   $PROG run NAME [-- qemu-args...]
   $PROG start NAME [-- qemu-args...]
   $PROG stop NAME
-  $PROG ssh NAME [ssh-args...]
+  $PROG ssh NAME [ssh-opts...] [-- remote-cmd...]
   $PROG list
   $PROG show NAME
   $PROG delete NAME
 
 Config keys:
-  disk, disk_size, disk_format, cdrom, memory, cpus, ssh_port, macaddr
+  disk, disk_size, disk_format, cdrom, memory, cpus, ssh_port, ssh_key, macaddr
+  net_iface, net_iface_mac, socket_vmnet_path, socket_vmnet_mode
   qemu, qemu_img, efi, accel, machine, net, headless, boot, extra_args
 
 Notes:
   - macOS/Apple Silicon defaults are tuned for aarch64 guests with hvf.
   - 'run' stays in the foreground. 'start' daemonizes and writes a pid file.
+  - Prefer net_iface_mac for removable USB NICs with net=vmnet-bridged.
+  - socket_vmnet requires an already-running socket_vmnet daemon.
 EOF
 }
 
@@ -115,6 +119,76 @@ quote_sh() {
 	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+default_socket_vmnet_client() {
+	if [ -n "$SOCKET_VMNET_CLIENT_BIN" ]; then
+		printf '%s\n' "$SOCKET_VMNET_CLIENT_BIN"
+		return
+	fi
+	for bin in \
+		/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client \
+		/usr/local/opt/socket_vmnet/bin/socket_vmnet_client
+	do
+		if [ -x "$bin" ]; then
+			printf '%s\n' "$bin"
+			return
+		fi
+	done
+	printf '%s\n' socket_vmnet_client
+}
+
+resolve_socket_vmnet_client() {
+	client=$(default_socket_vmnet_client)
+	if [ "${client#/}" != "$client" ]; then
+		[ -x "$client" ] || die "socket_vmnet_client not found at '$client'"
+	else
+		have "$client" || die "socket_vmnet_client not found; install socket_vmnet or set SOCKET_VMNET_CLIENT_BIN"
+	fi
+	printf '%s\n' "$client"
+}
+
+resolve_iface_by_mac() {
+	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+	have networksetup || die "networksetup is required to resolve net_iface_mac"
+	result=$(
+		networksetup -listallhardwareports 2>/dev/null | awk -v want="$want_mac" '
+			/^Device: / {
+				device = substr($0, 9)
+			}
+			/^Ethernet Address: / {
+				mac = tolower(substr($0, 19))
+				if (mac == want) {
+					count++
+					found_device = device
+				}
+			}
+			END {
+				if (count == 1) {
+					print found_device
+				} else if (count > 1) {
+					exit 2
+				} else {
+					exit 1
+				}
+			}
+		'
+	) || rc=$?
+	rc=${rc:-0}
+	case $rc in
+	0)
+		printf '%s\n' "$result"
+		;;
+	1)
+		die "net_iface_mac '$1' was not found; check whether the NIC is plugged in"
+		;;
+	2)
+		die "net_iface_mac '$1' matched multiple interfaces"
+		;;
+	*)
+		die "failed to resolve net_iface_mac '$1'"
+		;;
+	esac
+}
+
 load_config() {
 	name=$1
 	dir=$(instance_dir "$name")
@@ -141,8 +215,13 @@ load_config() {
 	disk_format=${disk_format:-$DISK_FORMAT_DEFAULT}
 	disk=${disk:-$instance_dir/disk.$disk_format}
 	ssh_port=${ssh_port:-$(default_ssh_port "$name")}
+	ssh_key=${ssh_key:-}
 	macaddr=${macaddr:-$(default_mac "$name")}
 	net=${net:-user}
+	net_iface=${net_iface:-}
+	net_iface_mac=${net_iface_mac:-}
+	socket_vmnet_path=${socket_vmnet_path:-}
+	socket_vmnet_mode=${socket_vmnet_mode:-shared}
 	headless=${headless:-yes}
 	boot=${boot:-menu=on,splash-time=0}
 	extra_args=${extra_args:-}
@@ -191,9 +270,38 @@ assemble_qemu() {
 			-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$ssh_port-:22" \
 			-device "virtio-net-pci,netdev=net0,mac=$macaddr"
 		;;
-	vmnet-shared|vmnet-host|vmnet-bridged)
+	vmnet-shared|vmnet-host)
 		set -- "$@" \
 			-netdev "$net,id=net0" \
+			-device "virtio-net-pci,netdev=net0,mac=$macaddr"
+		;;
+	vmnet-bridged)
+		netdev="$net,id=net0"
+		if [ -n "$net_iface_mac" ]; then
+			netdev_iface=$(resolve_iface_by_mac "$net_iface_mac")
+		elif [ -n "$net_iface" ]; then
+			netdev_iface=$net_iface
+		else
+			die "net=vmnet-bridged requires net_iface_mac or net_iface"
+		fi
+		netdev="$netdev,ifname=$netdev_iface"
+		set -- "$@" \
+			-netdev "$netdev" \
+			-device "virtio-net-pci,netdev=net0,mac=$macaddr"
+		;;
+	socket_vmnet)
+		[ -n "$socket_vmnet_path" ] || die "net=socket_vmnet requires socket_vmnet_path"
+		[ -S "$socket_vmnet_path" ] || die "socket_vmnet_path '$socket_vmnet_path' is not a socket; start socket_vmnet first"
+		case $socket_vmnet_mode in
+		shared|host|bridged)
+			:
+			;;
+		*)
+			die "unsupported socket_vmnet_mode '$socket_vmnet_mode'"
+			;;
+		esac
+		set -- "$@" \
+			-netdev "socket,id=net0,fd=3" \
 			-device "virtio-net-pci,netdev=net0,mac=$macaddr"
 		;;
 	none)
@@ -223,6 +331,11 @@ assemble_qemu() {
 		# Intentional word splitting for config-supplied raw QEMU flags.
 		# shellcheck disable=SC2086
 		set -- "$@" $extra_args
+	fi
+
+	if [ "$net" = "socket_vmnet" ]; then
+		socket_vmnet_client=$(resolve_socket_vmnet_client)
+		set -- "$socket_vmnet_client" "$socket_vmnet_path" "$@"
 	fi
 
 	cmd=
@@ -288,9 +401,14 @@ create_vm() {
 		cpus="$cpus" \
 		macaddr="$macaddr" \
 		ssh_port="$ssh_port" \
+		ssh_key="" \
 		disk_format="$disk_format" \
 		disk_size="$disk_size" \
 		disk="$disk" \
+		net_iface="" \
+		net_iface_mac="" \
+		socket_vmnet_path="" \
+		socket_vmnet_mode="shared" \
 		net="user" \
 		headless="yes" \
 		boot="menu=on,splash-time=0" \
@@ -319,10 +437,15 @@ create_vm() {
 		cpus="$cpus" \
 		macaddr="$macaddr" \
 		ssh_port="$ssh_port" \
+		ssh_key="$ssh_key" \
 		disk_format="$disk_format" \
 		disk_size="${disk_size:-0}" \
 		disk="$disk" \
 		cdrom="${cdrom:-}" \
+		net_iface="$net_iface" \
+		net_iface_mac="$net_iface_mac" \
+		socket_vmnet_path="$socket_vmnet_path" \
+		socket_vmnet_mode="$socket_vmnet_mode" \
 		net="$net" \
 		headless="$headless" \
 		boot="$boot" \
@@ -361,7 +484,24 @@ ssh_vm() {
 	name=$1
 	shift
 	load_config "$name"
-	exec ssh -p "$ssh_port" "$@" 127.0.0.1
+	[ "$net" = "user" ] || die "ssh is only supported with net=user; use the guest IP for net=$net"
+	ssh_args="-p $(quote_sh "$ssh_port") -o IdentitiesOnly=yes"
+	remote_args=
+	if [ -n "$ssh_key" ]; then
+		ssh_args="$ssh_args -i $(quote_sh "$ssh_key")"
+	fi
+	while [ "$#" -gt 0 ]; do
+		if [ "$1" = "--" ]; then
+			shift
+			break
+		fi
+		ssh_args="$ssh_args $(quote_sh "$1")"
+		shift
+	done
+	for arg do
+		remote_args="$remote_args $(quote_sh "$arg")"
+	done
+	eval "exec ssh $ssh_args 127.0.0.1$remote_args"
 }
 
 delete_vm() {
