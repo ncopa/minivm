@@ -6,6 +6,7 @@ Small POSIX shell manager for QEMU VMs on macOS.
 
 ```sh
 ./minivm.sh create edge cdrom=$HOME/Downloads/alpine.iso
+./minivm.sh create alpine image_url=https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/cloud/generic_alpine-3.24.1-aarch64-uefi-tiny-r0.qcow2 disk_size=32G
 ./minivm.sh run edge
 ./minivm.sh ssh edge root
 ./minivm.sh list

@@ -46,7 +46,7 @@ Usage:
   $PROG delete NAME
 
 Config keys:
-  disk, disk_size, disk_format, cdrom, memory, cpus, ssh_port, ssh_key, macaddr
+  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_key, macaddr
   net_iface, net_iface_mac, socket_vmnet_path
   qemu, qemu_img, efi, accel, machine, net, headless, boot, extra_args
 
@@ -189,6 +189,39 @@ resolve_socket_vmnet_client() {
 		have "$client" || die "socket_vmnet_client not found; install socket_vmnet or set SOCKET_VMNET_CLIENT_BIN"
 	fi
 	printf '%s\n' "$client"
+}
+
+resolve_downloader() {
+	if have curl; then
+		printf '%s\n' curl
+		return
+	fi
+	if have wget; then
+		printf '%s\n' wget
+		return
+	fi
+	die "curl or wget is required to download image_url"
+}
+
+download_file() {
+	url=$1
+	dest=$2
+	downloader=$(resolve_downloader)
+	case $downloader in
+	curl)
+		"$downloader" -L -f -o "$dest" "$url"
+		;;
+	wget)
+		"$downloader" -O "$dest" "$url"
+		;;
+	esac
+}
+
+qemu_img_format() {
+	image=$1
+	format=$("$qemu_img" info "$image" 2>/dev/null | awk '/^file format: / { print $3; exit }')
+	[ -n "$format" ] || die "failed to detect disk format for '$image'"
+	printf '%s\n' "$format"
 }
 
 resolve_ip_by_mac() {
@@ -373,6 +406,7 @@ load_config() {
 	cpus=${cpus:-$(default_cpus)}
 	disk_format=${disk_format:-$DISK_FORMAT_DEFAULT}
 	disk=${disk:-$instance_dir/disk.$disk_format}
+	image_url=${image_url:-}
 	ssh_port=${ssh_port:-$(default_ssh_port "$name")}
 	ssh_key=${ssh_key:-}
 	macaddr=${macaddr:-$(default_mac "$name")}
@@ -807,6 +841,7 @@ create_vm() {
 		disk_format="$disk_format" \
 		disk_size="$disk_size" \
 		disk="$disk" \
+		image_url="" \
 		net_iface="" \
 		net_iface_mac="" \
 		socket_vmnet_path="$SOCKET_VMNET_PATH_DEFAULT" \
@@ -842,6 +877,7 @@ create_vm() {
 		disk_format="$disk_format" \
 		disk_size="${disk_size:-0}" \
 		disk="$disk" \
+		image_url="$image_url" \
 		cdrom="${cdrom:-}" \
 		net_iface="$net_iface" \
 		net_iface_mac="$net_iface_mac" \
@@ -851,7 +887,21 @@ create_vm() {
 		boot="$boot" \
 		extra_args="$extra_args"
 	mkdir -p "$instance_dir"
-	if [ ! -e "$disk" ] && [ "${disk_size:-0}" != "0" ]; then
+	if [ -n "$image_url" ]; then
+		tmp_image=$instance_dir/image.download
+		rm -f "$tmp_image"
+		download_file "$image_url" "$tmp_image"
+		src_format=$(qemu_img_format "$tmp_image")
+		if [ "$src_format" = "$disk_format" ]; then
+			mv "$tmp_image" "$disk"
+		else
+			"$qemu_img" convert -f "$src_format" -O "$disk_format" "$tmp_image" "$disk"
+			rm -f "$tmp_image"
+		fi
+		if [ "${disk_size:-0}" != "0" ]; then
+			"$qemu_img" resize "$disk" "$disk_size" >/dev/null
+		fi
+	elif [ ! -e "$disk" ] && [ "${disk_size:-0}" != "0" ]; then
 		"$qemu_img" create -f "$disk_format" "$disk" "$disk_size" >/dev/null
 	fi
 	printf '%s\n' "created $name"
