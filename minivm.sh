@@ -1005,8 +1005,20 @@ show_vm() {
 }
 
 ssh_vm() {
-	name=$1
+	target=$1
 	shift
+	case $target in
+	*@*)
+		ssh_user=${target%%@*}
+		name=${target#*@}
+		[ -n "$ssh_user" ] || die "ssh requires a non-empty user before '@'"
+		[ -n "$name" ] || die "ssh requires a non-empty instance name after '@'"
+		;;
+	*)
+		ssh_user=
+		name=$target
+		;;
+	esac
 	load_config "$name"
 	case $net in
 	user)
@@ -1037,7 +1049,12 @@ ssh_vm() {
 	for arg do
 		remote_args="$remote_args $(quote_sh "$arg")"
 	done
-	eval "exec ssh $ssh_args $(quote_sh "$ssh_host")$remote_args"
+	if [ -n "$ssh_user" ]; then
+		ssh_target=$ssh_user@$ssh_host
+	else
+		ssh_target=$ssh_host
+	fi
+	eval "exec ssh $ssh_args $(quote_sh "$ssh_target")$remote_args"
 }
 
 delete_vm() {
