@@ -715,8 +715,15 @@ qmp_system_powerdown() {
 }
 
 assemble_qemu() {
-	load_config "$1"
+	name=$1
 	shift
+	mode=${1:-run}
+	if [ "$mode" = "run" ] || [ "$mode" = "start" ]; then
+		shift
+	else
+		mode=run
+	fi
+	load_config "$name"
 
 	mkdir -p "$runtime_dir" "$log_dir"
 	rm -f "$qmp_socket" "$qga_socket"
@@ -800,9 +807,16 @@ assemble_qemu() {
 	esac
 
 	if [ "$headless" = "yes" ]; then
+		if [ "$mode" = "start" ]; then
+			set -- "$@" \
+				-display none \
+				-serial null
+		else
+			set -- "$@" \
+				-nographic \
+				-serial mon:stdio
+		fi
 		set -- "$@" \
-			-nographic \
-			-serial mon:stdio \
 			-chardev "socket,id=qga,path=$qga_socket,server=on,wait=off" \
 			-device virtio-serial \
 			-device virtserialport,chardev=qga,name=org.qemu.guest_agent.0
@@ -837,7 +851,7 @@ assemble_qemu() {
 run_vm() {
 	name=$1
 	shift
-	cmd=$(assemble_qemu "$name" "$@")
+	cmd=$(assemble_qemu "$name" run "$@")
 	eval "set -- $cmd"
 	exec "$@"
 }
@@ -845,7 +859,7 @@ run_vm() {
 start_vm() {
 	name=$1
 	shift
-	cmd=$(assemble_qemu "$name" "$@")
+	cmd=$(assemble_qemu "$name" start "$@")
 	eval "set -- $cmd"
 	set -- "$@" -daemonize
 	"$@"
