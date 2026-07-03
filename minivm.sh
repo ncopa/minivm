@@ -374,16 +374,14 @@ resolve_dhcp_lease_ip_by_mac() {
 				sub(/^[[:space:]]*hw_address=[^,]*,/, "", block_mac)
 				next
 			}
-			END {
-				if (count == 1) {
-					print found_ip
-				} else if (count > 1) {
-					exit 2
-				} else {
-					exit 1
+				END {
+					if (count >= 1) {
+						print found_ip
+					} else {
+						exit 1
+					}
 				}
-			}
-		' "$lease_file"
+			' "$lease_file"
 	) || rc=$?
 	rc=${rc:-0}
 	case $rc in
@@ -393,9 +391,6 @@ resolve_dhcp_lease_ip_by_mac() {
 		;;
 	1)
 		return 1
-		;;
-	2)
-		die "guest MAC '$1' matched multiple IP addresses in the DHCP lease database"
 		;;
 	*)
 		return 1
