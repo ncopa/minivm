@@ -46,7 +46,7 @@ Usage:
   $PROG delete NAME
 
 Config keys:
-  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_identity, ssh_authorized_keys, macaddr
+  disk, disk_size, disk_format, image_url, cdrom, memory, cpus, ssh_port, ssh_identity, ssh_authorized_keys, user_data, macaddr
   net_iface, net_iface_mac, socket_vmnet_path
   qemu, qemu_img, efi, accel, machine, net, headless, boot, extra_args
 
@@ -255,6 +255,13 @@ append_authorized_keys_yaml() {
 	done
 }
 
+copy_user_data() {
+	src=$1
+	dest=$2
+	[ -f "$src" ] || die "user_data file '$src' does not exist"
+	cp "$src" "$dest"
+}
+
 build_cidata() {
 	name=$1
 	cloud_init_dir=$instance_dir/cloud-init
@@ -268,11 +275,15 @@ build_cidata() {
 instance-id: $name
 hostname: $name
 EOF
-	{
-		printf '%s\n' '#cloud-config'
-		printf '%s\n' 'ssh_authorized_keys:'
-		append_authorized_keys_yaml "$ssh_authorized_keys"
-	} >"$user_data"
+	if [ -n "$user_data_path" ]; then
+		copy_user_data "$user_data_path" "$user_data"
+	else
+		{
+			printf '%s\n' '#cloud-config'
+			printf '%s\n' 'ssh_authorized_keys:'
+			append_authorized_keys_yaml "$ssh_authorized_keys"
+		} >"$user_data"
+	fi
 
 	rm -f "$cidata_iso"
 	case $iso_creator in
@@ -471,6 +482,7 @@ load_config() {
 	ssh_port=${ssh_port:-$(default_ssh_port "$name")}
 	ssh_identity=${ssh_identity:-}
 	ssh_authorized_keys=${ssh_authorized_keys:-}
+	user_data_path=${user_data:-}
 	macaddr=${macaddr:-$(default_mac "$name")}
 	net=${net:-user}
 	net_iface=${net_iface:-}
@@ -922,6 +934,7 @@ create_vm() {
 		ssh_port="$ssh_port" \
 		ssh_identity="" \
 		ssh_authorized_keys="" \
+		user_data="" \
 		disk_format="$disk_format" \
 		disk_size="$disk_size" \
 		disk="$disk" \
@@ -959,6 +972,7 @@ create_vm() {
 		ssh_port="$ssh_port" \
 		ssh_identity="$ssh_identity" \
 		ssh_authorized_keys="$ssh_authorized_keys" \
+		user_data="$user_data_path" \
 		disk_format="$disk_format" \
 		disk_size="${disk_size:-0}" \
 		disk="$disk" \
@@ -989,7 +1003,10 @@ create_vm() {
 	elif [ ! -e "$disk" ] && [ "${disk_size:-0}" != "0" ]; then
 		"$qemu_img" create -f "$disk_format" "$disk" "$disk_size" >/dev/null
 	fi
-	if [ -n "$ssh_authorized_keys" ]; then
+	if [ -n "$ssh_authorized_keys" ] && [ -n "$user_data_path" ]; then
+		die "ssh_authorized_keys and user_data are mutually exclusive"
+	fi
+	if [ -n "$ssh_authorized_keys" ] || [ -n "$user_data_path" ]; then
 		build_cidata "$name"
 	fi
 	printf '%s\n' "created $name"
