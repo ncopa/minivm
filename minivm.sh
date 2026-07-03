@@ -41,6 +41,7 @@ Usage:
   $PROG poweroff NAME
   $PROG reboot NAME
   $PROG ssh NAME [ssh-opts...] [-- remote-cmd...]
+  $PROG ip NAME
   $PROG list
   $PROG show NAME
   $PROG delete NAME
@@ -1035,6 +1036,25 @@ show_vm() {
 	cat "$(config_path "$name")"
 }
 
+ip_vm() {
+	name=$1
+	load_config "$name"
+	case $net in
+	user)
+		die "ip is not available for net=user; use 127.0.0.1:$ssh_port"
+		;;
+	socket_vmnet|vmnet-shared|vmnet-host|vmnet-bridged)
+		resolve_guest_ip "$macaddr"
+		;;
+	none)
+		die "ip is not available for net=none"
+		;;
+	*)
+		die "ip is not supported for net=$net"
+		;;
+	esac
+}
+
 ssh_vm() {
 	target=$1
 	shift
@@ -1166,6 +1186,10 @@ ssh)
 	name=$1
 	shift
 	ssh_vm "$name" "$@"
+	;;
+ip)
+	[ $# -eq 1 ] || die "ip requires NAME"
+	ip_vm "$1"
 	;;
 list)
 	[ $# -eq 0 ] || die "list takes no arguments"
