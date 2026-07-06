@@ -357,9 +357,13 @@ resolve_dhcp_lease_ip_by_mac() {
 				next
 			}
 			/^\}/ {
-				if (in_block && tolower(block_mac) == want && block_ip ~ /^[0-9.]+$/) {
+				block_mac = tolower(block_mac)
+				if (in_block && block_ip ~ /^[0-9.]+$/ &&
+				    (block_mac == want || substr(block_mac, length(block_mac) - length(want) + 1) == want)) {
+					if (count == 0) {
+						found_ip = block_ip
+					}
 					count++
-					found_ip = block_ip
 				}
 				in_block = 0
 				next
