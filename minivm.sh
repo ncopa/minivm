@@ -339,6 +339,21 @@ resolve_ip_by_mac() {
 	esac
 }
 
+list_arp_ips_by_mac() {
+	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+	have arp || return 0
+	arp -an 2>/dev/null | awk -v want="$want_mac" '
+		{
+			ip = $2
+			mac = tolower($4)
+			gsub(/[()]/, "", ip)
+			if (mac == want && ip ~ /^[0-9.]+$/ && !seen[ip]++) {
+				print ip
+			}
+		}
+	'
+}
+
 resolve_dhcp_lease_ip_by_mac() {
 	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 	lease_file=/var/db/dhcpd_leases
@@ -400,6 +415,45 @@ resolve_dhcp_lease_ip_by_mac() {
 		return 1
 		;;
 	esac
+}
+
+list_dhcp_lease_ips_by_mac() {
+	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+	lease_file=/var/db/dhcpd_leases
+	[ -r "$lease_file" ] || return 0
+	awk -v want="$want_mac" '
+		BEGIN {
+			in_block = 0
+			block_ip = ""
+			block_mac = ""
+		}
+		/^\{/ {
+			in_block = 1
+			block_ip = ""
+			block_mac = ""
+			next
+		}
+		/^\}/ {
+			block_mac = tolower(block_mac)
+			if (in_block && block_ip ~ /^[0-9.]+$/ &&
+			    (block_mac == want || substr(block_mac, length(block_mac) - length(want) + 1) == want) &&
+			    !seen[block_ip]++) {
+				print block_ip
+			}
+			in_block = 0
+			next
+		}
+		in_block && /^[[:space:]]*ip_address=/ {
+			block_ip = $0
+			sub(/^[[:space:]]*ip_address=/, "", block_ip)
+			next
+		}
+		in_block && /^[[:space:]]*hw_address=/ {
+			block_mac = $0
+			sub(/^[[:space:]]*hw_address=[^,]*,/, "", block_mac)
+			next
+		}
+	' "$lease_file"
 }
 
 resolve_guest_ip() {
@@ -1107,12 +1161,34 @@ ssh_vm() {
 	eval "exec ssh $ssh_args $(quote_sh "$ssh_target")$remote_args"
 }
 
+remove_known_host() {
+	have ssh-keygen || return 0
+	ssh-keygen -R "$1" >/dev/null 2>&1 || true
+}
+
+cleanup_known_hosts() {
+	case $net in
+	user)
+		remove_known_host "[127.0.0.1]:$ssh_port"
+		;;
+	socket_vmnet)
+		{
+			list_dhcp_lease_ips_by_mac "$macaddr"
+			list_arp_ips_by_mac "$macaddr"
+		} | awk 'NF && !seen[$0]++' | while IFS= read -r ip; do
+			remove_known_host "$ip"
+		done
+		;;
+	esac
+}
+
 delete_vm() {
 	name=$1
 	load_config "$name"
 	if [ -f "$pidfile" ]; then
 		die "instance '$name' is running; kill it first"
 	fi
+	cleanup_known_hosts
 	rm -rf "$instance_dir"
 	printf '%s\n' "deleted $name"
 }
