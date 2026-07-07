@@ -41,7 +41,7 @@ Usage:
   $PROG poweroff NAME
   $PROG reboot NAME
   $PROG ssh NAME [ssh-opts...] [-- remote-cmd...]
-  $PROG ip NAME
+  $PROG ip [--wait[=SECONDS]] NAME
   $PROG list
   $PROG show NAME
   $PROG delete NAME
@@ -543,11 +543,29 @@ list_dhcp_lease_ips_by_mac() {
 }
 
 resolve_guest_ip() {
-	if ip=$(resolve_dhcp_lease_ip_by_mac "$1" 2>/dev/null); then
-		printf '%s\n' "$ip"
-		return
+	if leases=$(list_dhcp_lease_ips_by_mac "$1" 2>/dev/null) && [ -n "$leases" ]; then
+		ip=$(printf '%s\n' "$leases" | awk 'NF { print; exit }')
+		if list_arp_ips_by_mac "$1" | awk -v ip="$ip" '$0 == ip { found = 1 } END { exit !found }'; then
+			printf '%s\n' "$ip"
+			return
+		fi
+		die "latest DHCP lease for MAC '$1' is $ip but ARP does not confirm it; guest may still be booting"
 	fi
 	resolve_ip_by_mac "$1"
+}
+
+wait_guest_ip() {
+	mac=$1
+	timeout=$2
+	while [ "$timeout" -gt 0 ]; do
+		if ip=$(resolve_guest_ip "$mac" 2>/dev/null); then
+			printf '%s\n' "$ip"
+			return 0
+		fi
+		sleep 1
+		timeout=$((timeout - 1))
+	done
+	resolve_guest_ip "$mac"
 }
 
 resolve_iface_by_mac() {
@@ -638,6 +656,37 @@ load_config() {
 
 cleanup_runtime() {
 	rm -f "$pidfile" "$qmp_socket" "$qga_socket"
+}
+
+process_running() {
+	pid=$1
+	[ -n "$pid" ] || return 1
+	if have ps && ps -p "$pid" >/dev/null 2>&1; then
+		return 0
+	fi
+	if kill_output=$(kill -0 "$pid" 2>&1); then
+		return 0
+	fi
+	case $kill_output in
+	*[Oo]peration\ not\ permitted*|*[Nn]ot\ permitted*)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+vm_running() {
+	[ -f "$pidfile" ] || return 1
+	pid=$(cat "$pidfile")
+	process_running "$pid"
+}
+
+cleanup_stale_runtime() {
+	[ -f "$pidfile" ] || return 0
+	pid=$(cat "$pidfile")
+	if ! process_running "$pid"; then
+		cleanup_runtime
+	fi
 }
 
 socket_vmnet_mode() {
@@ -806,12 +855,10 @@ socket_vmnet_status() {
 require_running_vm() {
 	name=$1
 	load_config "$name"
-	[ -f "$pidfile" ] || die "instance '$name' is not running"
-	pid=$(cat "$pidfile")
-	kill -0 "$pid" 2>/dev/null || {
+	if ! vm_running; then
 		cleanup_runtime
 		die "instance '$name' is not running"
-	}
+	fi
 }
 
 wait_for_vm_exit() {
@@ -1009,6 +1056,11 @@ run_vm() {
 start_vm() {
 	name=$1
 	shift
+	load_config "$name"
+	if vm_running; then
+		die "instance '$name' is already running"
+	fi
+	cleanup_stale_runtime
 	cmd=$(assemble_qemu "$name" start "$@")
 	eval "set -- $cmd"
 	set -- "$@" -daemonize
@@ -1020,6 +1072,7 @@ kill_vm() {
 	name=$1
 	require_running_vm "$name"
 	kill "$pid"
+	wait_for_vm_exit "$SHUTDOWN_TIMEOUT" || die "timed out waiting for '$name' to exit"
 	cleanup_runtime
 	printf '%s\n' "killed $name"
 }
@@ -1157,7 +1210,8 @@ list_vms() {
 		[ -d "$dir" ] || continue
 		name=${dir##*/}
 		found=true
-		if [ -f "$dir/run/qemu.pid" ]; then
+		load_config "$name"
+		if vm_running; then
 			state=running
 		else
 			state=stopped
@@ -1175,14 +1229,36 @@ show_vm() {
 
 ip_vm() {
 	name=$1
+	wait_timeout=0
+	case $name in
+	--wait)
+		wait_timeout=60
+		shift
+		name=$1
+		;;
+	--wait=*)
+		wait_timeout=${name#--wait=}
+		shift
+		name=$1
+		;;
+	esac
+	case $wait_timeout in
+	''|*[!0-9]*)
+		die "ip --wait requires a timeout in seconds"
+		;;
+	esac
 	load_config "$name"
 	case $net in
 	user)
 		die "ip is not available for net=user; use 127.0.0.1:$ssh_port"
 		;;
 	socket_vmnet|vmnet-shared|vmnet-host|vmnet-bridged)
-		resolve_guest_ip "$macaddr"
-		;;
+			if [ "$wait_timeout" -gt 0 ]; then
+				wait_guest_ip "$macaddr" "$wait_timeout"
+			else
+				resolve_guest_ip "$macaddr"
+			fi
+			;;
 	none)
 		die "ip is not available for net=none"
 		;;
@@ -1269,9 +1345,10 @@ cleanup_known_hosts() {
 delete_vm() {
 	name=$1
 	load_config "$name"
-	if [ -f "$pidfile" ]; then
+	if vm_running; then
 		die "instance '$name' is running; kill it first"
 	fi
+	cleanup_stale_runtime
 	cleanup_known_hosts
 	rm -rf "$instance_dir"
 	printf '%s\n' "deleted $name"
@@ -1347,8 +1424,8 @@ ssh)
 	ssh_vm "$name" "$@"
 	;;
 ip)
-	[ $# -eq 1 ] || die "ip requires NAME"
-	ip_vm "$1"
+	[ $# -ge 1 ] && [ $# -le 2 ] || die "ip requires [--wait[=SECONDS]] NAME"
+	ip_vm "$@"
 	;;
 list)
 	[ $# -eq 0 ] || die "list takes no arguments"
