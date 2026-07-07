@@ -302,9 +302,28 @@ resolve_ip_by_mac() {
 	have arp || die "arp is required to resolve guest IP for MAC '$1'"
 	result=$(
 		arp -an 2>/dev/null | awk -v want="$want_mac" '
+			function normalize_mac(value,   n, parts, i, out, sep) {
+				gsub(/,/, ":", value)
+				n = split(value, parts, ":")
+				for (i = 1; i <= n; i++) {
+					if (parts[i] !~ /^[0-9a-f]+$/) {
+						continue
+					}
+					sub(/^0+/, "", parts[i])
+					if (parts[i] == "") {
+						parts[i] = "0"
+					}
+					out = out sep parts[i]
+					sep = ":"
+				}
+				return out
+			}
+			BEGIN {
+				want = normalize_mac(want)
+			}
 			{
 				ip = $2
-				mac = tolower($4)
+				mac = normalize_mac(tolower($4))
 				gsub(/[()]/, "", ip)
 				if (mac == want && ip ~ /^[0-9.]+$/) {
 					count++
@@ -343,9 +362,28 @@ list_arp_ips_by_mac() {
 	want_mac=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 	have arp || return 0
 	arp -an 2>/dev/null | awk -v want="$want_mac" '
+		function normalize_mac(value,   n, parts, i, out, sep) {
+			gsub(/,/, ":", value)
+			n = split(value, parts, ":")
+			for (i = 1; i <= n; i++) {
+				if (parts[i] !~ /^[0-9a-f]+$/) {
+					continue
+				}
+				sub(/^0+/, "", parts[i])
+				if (parts[i] == "") {
+					parts[i] = "0"
+				}
+				out = out sep parts[i]
+				sep = ":"
+			}
+			return out
+		}
+		BEGIN {
+			want = normalize_mac(want)
+		}
 		{
 			ip = $2
-			mac = tolower($4)
+			mac = normalize_mac(tolower($4))
 			gsub(/[()]/, "", ip)
 			if (mac == want && ip ~ /^[0-9.]+$/ && !seen[ip]++) {
 				print ip
@@ -360,10 +398,34 @@ resolve_dhcp_lease_ip_by_mac() {
 	[ -r "$lease_file" ] || return 1
 	result=$(
 		awk -v want="$want_mac" '
+			function normalize_mac(value,   n, parts, i, out, sep) {
+				gsub(/,/, ":", value)
+				n = split(value, parts, ":")
+				for (i = 1; i <= n; i++) {
+					if (parts[i] !~ /^[0-9a-f]+$/) {
+						continue
+					}
+					sub(/^0+/, "", parts[i])
+					if (parts[i] == "") {
+						parts[i] = "0"
+					}
+					out = out sep parts[i]
+					sep = ":"
+				}
+				return out
+			}
+			function has_mac_suffix(value, suffix,   start) {
+				if (value == suffix) {
+					return 1
+				}
+				start = length(value) - length(suffix) + 1
+				return start > 1 && substr(value, start) == suffix && substr(value, start - 1, 1) == ":"
+			}
 			BEGIN {
 				in_block = 0
 				block_ip = ""
 				block_mac = ""
+				want = normalize_mac(want)
 			}
 			/^\{/ {
 				in_block = 1
@@ -372,9 +434,9 @@ resolve_dhcp_lease_ip_by_mac() {
 				next
 			}
 			/^\}/ {
-				block_mac = tolower(block_mac)
+				block_mac = normalize_mac(tolower(block_mac))
 				if (in_block && block_ip ~ /^[0-9.]+$/ &&
-				    (block_mac == want || substr(block_mac, length(block_mac) - length(want) + 1) == want)) {
+				    has_mac_suffix(block_mac, want)) {
 					if (count == 0) {
 						found_ip = block_ip
 					}
@@ -422,10 +484,34 @@ list_dhcp_lease_ips_by_mac() {
 	lease_file=/var/db/dhcpd_leases
 	[ -r "$lease_file" ] || return 0
 	awk -v want="$want_mac" '
+		function normalize_mac(value,   n, parts, i, out, sep) {
+			gsub(/,/, ":", value)
+			n = split(value, parts, ":")
+			for (i = 1; i <= n; i++) {
+				if (parts[i] !~ /^[0-9a-f]+$/) {
+					continue
+				}
+				sub(/^0+/, "", parts[i])
+				if (parts[i] == "") {
+					parts[i] = "0"
+				}
+				out = out sep parts[i]
+				sep = ":"
+			}
+			return out
+		}
+		function has_mac_suffix(value, suffix,   start) {
+			if (value == suffix) {
+				return 1
+			}
+			start = length(value) - length(suffix) + 1
+			return start > 1 && substr(value, start) == suffix && substr(value, start - 1, 1) == ":"
+		}
 		BEGIN {
 			in_block = 0
 			block_ip = ""
 			block_mac = ""
+			want = normalize_mac(want)
 		}
 		/^\{/ {
 			in_block = 1
@@ -434,9 +520,9 @@ list_dhcp_lease_ips_by_mac() {
 			next
 		}
 		/^\}/ {
-			block_mac = tolower(block_mac)
+			block_mac = normalize_mac(tolower(block_mac))
 			if (in_block && block_ip ~ /^[0-9.]+$/ &&
-			    (block_mac == want || substr(block_mac, length(block_mac) - length(want) + 1) == want) &&
+			    has_mac_suffix(block_mac, want) &&
 			    !seen[block_ip]++) {
 				print block_ip
 			}
