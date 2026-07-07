@@ -577,11 +577,8 @@ cleanup_socket_vmnet_runtime() {
 socket_vmnet_running() {
 	[ -f "$(socket_vmnet_pidfile)" ] || return 1
 	socket_vmnet_pid=$(cat "$(socket_vmnet_pidfile)")
-	kill -0 "$socket_vmnet_pid" 2>/dev/null || {
-		cleanup_socket_vmnet_runtime
-		return 1
-	}
-	return 0
+	have ps || die "ps is required to check socket_vmnet status"
+	ps -p "$socket_vmnet_pid" >/dev/null 2>&1
 }
 
 require_root() {
@@ -648,6 +645,7 @@ start_socket_vmnet() {
 		printf '%s\n' "socket_vmnet already running"
 		return 0
 	fi
+	cleanup_socket_vmnet_runtime
 	rm -f "$(socket_vmnet_path)"
 
 	socket_vmnet_bin=$(resolve_socket_vmnet)
